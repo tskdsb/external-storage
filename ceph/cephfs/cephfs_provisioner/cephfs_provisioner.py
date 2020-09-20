@@ -20,6 +20,7 @@ import cephfs
 import getopt
 import sys
 import json
+import argparse
 
 """
 CEPH_CLUSTER_NAME=test CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQCMpH9YM4Q1BhAAXGNQyyOne8ZsXqWGon/dIQ== cephfs_provisioner.py -n foo -u bar
@@ -47,6 +48,22 @@ class CephFSNativeDriver(object):
             self.ceph_namespace_isolation_disabled = True
         except KeyError:
             self.ceph_namespace_isolation_disabled = False
+        try:
+            self.cluster_name = os.environ["CEPH_CLUSTER_NAME"]
+        except KeyError:
+            self.cluster_name = "ceph"
+        try:     
+            self.mons = os.environ["CEPH_MON"]
+        except KeyError:
+            raise ValueError("Missing CEPH_MON env")
+        try:
+            self.auth_id = os.environ["CEPH_AUTH_ID"]
+        except KeyError:
+            raise ValueError("Missing CEPH_AUTH_ID")
+        try: 
+            self.auth_key = os.environ["CEPH_AUTH_KEY"]
+        except:
+            raise ValueError("Missing CEPH_AUTH_KEY")
         self._volume_client = None
         # Default volume_prefix to None; the CephFSVolumeClient constructor uses a ternary operator on the input argument to default it to /volumes
         self.volume_prefix = os.environ.get('CEPH_VOLUME_ROOT', None)
@@ -219,10 +236,15 @@ class CephFSNativeDriver(object):
         assert caps[0]['entity'] == client_entity
         return caps[0]
 
-    def create_share(self, path, user_id, size=None):
+    def create_share(self, args):
         """Create a CephFS volume.
         """
-        volume_path = ceph_volume_client.VolumePath(self.volume_group, path)
+        path = args.path
+        size=args.size
+        
+        subpaths = os.path.split(path)
+        group_id, volume_id = subpaths[0],subpaths[1]
+        volume_path = ceph_volume_client.VolumePath(group_id, volume_id)
 
         # Create the CephFS volume
         volume = self.volume_client.create_volume(volume_path, size=size, namespace_isolated=not self.ceph_namespace_isolation_disabled)
@@ -237,11 +259,33 @@ class CephFSNativeDriver(object):
         """TODO
         restrict to user_id
         """
-        auth_result = self._authorize_ceph(volume_path, user_id, False)
+        auth_result = self._authorize_ceph(volume_path, self.auth_id, False)
         ret = {
             'path': export_location,
             'user': auth_result['entity'],
             'auth': auth_result['key']
+        }
+        return json.dumps(ret)
+
+    def set_max_bytes(self, args):
+        path = args.path
+        size=args.size
+        subpaths = os.path.split(path)
+        group_id, volume_id = subpaths[0],subpaths[1]
+        volumePath = ceph_volume_client.VolumePath(group_id, volume_id)
+        self.volume_client.set_max_bytes(volumePath,size)
+            
+        mon_addrs = self.volume_client.get_mon_addrs()
+        export_location = "{addrs}:{path}".format(
+            addrs=",".join(mon_addrs),
+            path=path)
+
+        """TODO
+        restrict to user_id
+        """
+        # auth_result = self._authorize_ceph(volumePath, self.auth_id, False)
+        ret = {
+            'path': export_location,
         }
         return json.dumps(ret)
 
@@ -314,9 +358,12 @@ class CephFSNativeDriver(object):
             # Already gone, great.
             return
 
-    def delete_share(self, path, user_id):
-        volume_path = ceph_volume_client.VolumePath(self.volume_group, path)
-        self._deauthorize(volume_path, user_id)
+    def delete_share(self, args):
+        path = args.path
+        subpaths = os.path.split(path)
+        group_id, volume_id = subpaths[0],subpaths[1]
+        volume_path = ceph_volume_client.VolumePath(group_id, volume_id)        
+        self._deauthorize(volume_path, self.auth_id)
         self.volume_client.delete_volume(volume_path)
         self.volume_client.purge_volume(volume_path)
 
@@ -325,39 +372,50 @@ class CephFSNativeDriver(object):
             self._volume_client.disconnect()
             self._volume_client = None
 
-def usage():
-    print "Usage: " + sys.argv[0] + " --remove -n share_name -u ceph_user_id -s size"
+def build_arguments_parser(cephfs):
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+    subparsers.required = True
+
+    # create
+    create_parser = subparsers.add_parser("create",
+                                      help="create file")
+    create_parser.set_defaults(func=cephfs.create_share)
+    add_common_params(create_parser)
+
+    # set max size
+    set_parser = subparsers.add_parser("set",
+                                         help="set max size")
+    set_parser.set_defaults(func=cephfs.set_max_bytes)
+    add_common_params(set_parser)
+
+    # delete 
+    delete_parser = subparsers.add_parser("delete",
+                                         help="delete file")
+    delete_parser.set_defaults(func=cephfs.delete_share)
+    add_common_params(delete_parser)
+
+    return parser
+
+def add_common_params(parser):
+    parser.add_argument("-p",
+                        "--path",
+                        type=str,
+                        help="path ")
+    parser.add_argument("-s",
+                        "--size",
+                        type=int,
+                        help="size bytes")
 
 def main():
-    create = True
-    share = ""
-    user = ""
-    size = None
     cephfs = CephFSNativeDriver()
+    parser = build_arguments_parser(cephfs)
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "rn:u:s:", ["remove"])
-    except getopt.GetoptError:
-        usage()
+        args, _ = parser.parse_known_args()
+    except TypeError:
+        parser.print_help(sys.stderr)
         sys.exit(1)
-
-    for opt, arg in opts:
-        if opt == '-n':
-            share = arg
-        elif opt == '-u':
-            user = arg
-        elif opt == '-s':
-            size = arg
-        elif opt in ("-r", "--remove"):
-            create = False
-
-    if share == "" or user == "":
-        usage()
-        sys.exit(1)
-
-    if create:
-        print cephfs.create_share(share, user, size=size)
-    else:
-        cephfs.delete_share(share, user)
+    print(args.func(args))
 
 
 if __name__ == "__main__":
